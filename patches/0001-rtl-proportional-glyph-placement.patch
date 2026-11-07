@@ -1,0 +1,102 @@
+diff --git a/wezterm-gui/src/shapecache.rs b/wezterm-gui/src/shapecache.rs
+index e01ea4d..ff83fa1 100644
+--- a/wezterm-gui/src/shapecache.rs
++++ b/wezterm-gui/src/shapecache.rs
+@@ -18,6 +18,7 @@ pub struct GlyphPosition {
+     pub x_offset: PixelLength,
+     pub bearing_x: f32,
+     pub bitmap_pixel_width: u32,
++    pub is_space: bool,
+ }
+ 
+ #[derive(Debug)]
+@@ -42,6 +43,7 @@ impl ShapedInfo {
+                         .as_ref()
+                         .map_or(0, |t| t.coords.width() as u32),
+                     num_cells: info.num_cells,
++                    is_space: info.is_space,
+                     x_offset: info.x_offset,
+                     bearing_x: glyph.bearing_x.get() as f32,
+                 },
+diff --git a/wezterm-gui/src/termwindow/render/screen_line.rs b/wezterm-gui/src/termwindow/render/screen_line.rs
+index c930e47..eeb9176 100644
+--- a/wezterm-gui/src/termwindow/render/screen_line.rs
++++ b/wezterm-gui/src/termwindow/render/screen_line.rs
+@@ -88,7 +88,7 @@ impl crate::TermWindow {
+ 
+         let mut composition_width = 0;
+ 
+-        let (_bidi_enabled, bidi_direction) = params.line.bidi_info();
++        let (bidi_enabled, bidi_direction) = params.line.bidi_info();
+         let direction = bidi_direction.direction();
+ 
+         // Do we need to shape immediately, or can we use the pre-shaped data?
+@@ -475,6 +475,34 @@ impl crate::TermWindow {
+                 };
+             }
+ 
++            // RTL runs (Arabic, Persian, Hebrew...) are shaped into glyphs
++            // whose advances don't match the fixed cell width. Forcing each
++            // glyph into a cell slot breaks cursive joining. For such runs
++            // we place glyphs using their real advances, right-justified
++            // within the run's cell span. The run still occupies exactly
++            // `cluster.width` cells, so cursor, selection and column
++            // alignment are unaffected.
++            let rtl_proportional = bidi_enabled
++                && !params.use_pixel_positioning
++                && cluster.direction == Direction::RightToLeft;
++            let cluster_span = cluster.width as f32 * cell_width;
++            let cluster_start_x = cluster_x_pos;
++            // Spare room (cell span minus real glyph widths) is spread over
++            // the spaces between words so letters keep touching each other.
++            // A run without spaces is simply right-justified in its span.
++            let mut space_extra = 0.;
++            if rtl_proportional {
++                let natural_width = item.pixel_width * width_scale;
++                let slack = (cluster_span - natural_width).max(0.);
++                let spaces = glyph_info.iter().filter(|i| i.pos.is_space).count();
++                if spaces > 0 {
++                    space_extra = slack / spaces as f32;
++                } else {
++                    cluster_x_pos += slack;
++                }
++            }
++            let pixel_glyphs = params.use_pixel_positioning || rtl_proportional;
++
+             for info in glyph_info.iter() {
+                 let glyph = &info.glyph;
+ 
+@@ -531,7 +559,7 @@ impl crate::TermWindow {
+                         // TODO: clipping, but we can do that based on pixels
+ 
+                         let pos_x = cluster_x_pos
+-                            + if params.use_pixel_positioning {
++                            + if pixel_glyphs {
+                                 (glyph.x_offset + glyph.bearing_x).get() as f32
+                             } else {
+                                 0.
+@@ -696,13 +724,23 @@ impl crate::TermWindow {
+                     phys_cell_idx += info.pos.num_cells as usize;
+                 }
+                 visual_cell_idx += info.pos.num_cells as usize;
+-                cluster_x_pos += if params.use_pixel_positioning {
++                cluster_x_pos += if pixel_glyphs {
+                     glyph.x_advance.get() as f32 * width_scale
++                        + if rtl_proportional && info.pos.is_space {
++                            space_extra
++                        } else {
++                            0.
++                        }
+                 } else {
+                     info.pos.num_cells as f32 * cell_width
+                 };
+             }
+ 
++            if rtl_proportional {
++                // Snap back to the cell grid for whatever follows
++                cluster_x_pos = cluster_start_x + cluster_span;
++            }
++
+             match direction {
+                 Direction::RightToLeft => {
+                     // And decrement it again
