@@ -1,5 +1,45 @@
+diff --git a/bidi/src/lib.rs b/bidi/src/lib.rs
+index 3840846..a27e652 100644
+--- a/bidi/src/lib.rs
++++ b/bidi/src/lib.rs
+@@ -239,11 +239,12 @@ impl BidiContext {
+         // removed_by_x9() but `reordered` does NOT (for compatibility with
+         // the UCD test suite).
+         // We need to account for that when we reorder the levels here!
++        let line_start = line_range.start;
+         let (levels, reordered) = self.reorder_line(line_range);
+         let mut reordered_levels = vec![Level(NO_LEVEL); reordered.len()];
+ 
+         for (vis_idx, &log_idx) in reordered.iter().enumerate() {
+-            reordered_levels[vis_idx] = levels[log_idx];
++            reordered_levels[vis_idx] = levels[log_idx - line_start];
+         }
+ 
+         reordered_levels.retain(|l| !l.removed_by_x9());
+@@ -2020,6 +2021,21 @@ mod tests {
+     use alloc::format;
+     use k9::assert_equal as assert_eq;
+ 
++    #[test]
++    fn wrapped_runs_keep_paragraph_indices() {
++        let text: Vec<char> = "سلام (English 123) دنیا".chars().collect();
++        let mut context = BidiContext::new();
++        context.resolve_paragraph(&text, ParagraphDirectionHint::AutoLeftToRight);
++        let range = 7..text.len();
++        let (_, expected) = context.reorder_line(range.clone());
++        let actual: Vec<usize> = context
++            .reordered_runs(range)
++            .into_iter()
++            .flat_map(|run| run.indices)
++            .collect();
++        assert_eq!(actual, expected);
++    }
++
+     #[test]
+     fn runs() {
+         let text = vec!['א', 'ב', 'ג', 'a', 'b', 'c'];
 diff --git a/term/src/screen.rs b/term/src/screen.rs
-index 4c52d37..b6e453b 100644
+index 4c52d37..4d1b0c4 100644
 --- a/term/src/screen.rs
 +++ b/term/src/screen.rs
 @@ -191,6 +191,18 @@ impl Screen {
@@ -43,6 +83,243 @@ index 4c52d37..b6e453b 100644
              }
          } else {
              // Compute the new cursor location; this is logically the inverse
+@@ -952,6 +964,7 @@ impl Screen {
+     where
+         F: FnMut(&mut [&mut Line]),
+     {
++        self.resolve_paragraph_bidi(phys_range.clone());
+         let (first, second) = self.lines.as_mut_slices();
+         let first_len = first.len();
+         let first_range = 0..first.len();
+@@ -971,6 +984,64 @@ impl Screen {
+         func(&mut lines)
+     }
+ 
++    /// Resolve UBA over complete retained logical lines, including context
++    /// outside the viewport. Only soft-wrap flags join rows; hard newlines
++    /// and changes of bidi mode delimit paragraphs.
++    fn resolve_paragraph_bidi(&mut self, requested: Range<PhysRowIndex>) {
++        use wezterm_bidi::BidiContext;
++        use wezterm_surface::cellcluster::BidiLine;
++        let mut start = requested.start.min(self.lines.len());
++        if start >= self.lines.len() || requested.is_empty() {
++            return;
++        }
++        while start > 0
++            && self.lines[start - 1].last_cell_was_wrapped()
++            && self.lines[start - 1].bidi_info() == self.lines[start].bidi_info()
++        {
++            start -= 1;
++        }
++        while start < requested.end.min(self.lines.len()) {
++            let mode = self.lines[start].bidi_info();
++            let mut end = start + 1;
++            while end < self.lines.len()
++                && self.lines[end - 1].last_cell_was_wrapped()
++                && self.lines[end].bidi_info() == mode
++            {
++                end += 1;
++            }
++            if mode.0 {
++                let mut text = Vec::new();
++                let mut ranges = Vec::new();
++                for line in self.lines.iter().skip(start).take(end - start) {
++                    let first = text.len();
++                    for cell in line.visible_cells() {
++                        text.extend(cell.str().chars());
++                    }
++                    ranges.push(first..text.len());
++                }
++                let mut context = BidiContext::new();
++                context.resolve_paragraph(&text, mode.1);
++                for (row, range) in (start..end).zip(ranges) {
++                    let offset = range.start;
++                    let runs = context
++                        .reordered_runs(range)
++                        .into_iter()
++                        .map(|r| ((r.range.start - offset..r.range.end - offset), r.direction))
++                        .collect();
++                    self.lines[row].set_paragraph_bidi(Some(BidiLine {
++                        direction: context.base_level().direction(),
++                        runs,
++                    }));
++                }
++            } else {
++                for row in start..end {
++                    self.lines[row].set_paragraph_bidi(None);
++                }
++            }
++            start = end;
++        }
++    }
++
+     pub fn for_each_phys_line<F>(&self, mut f: F)
+     where
+         F: FnMut(usize, &Line),
+diff --git a/term/src/test/csi.rs b/term/src/test/csi.rs
+index 2e5e966..2243781 100644
+--- a/term/src/test/csi.rs
++++ b/term/src/test/csi.rs
+@@ -201,6 +201,7 @@ fn test_789() {
+         bits: LineBits(
+             0x0,
+         ),
++        paragraph_bidi: None,
+         appdata: Mutex {
+             data: None,
+             poisoned: false,
+diff --git a/term/src/test/mod.rs b/term/src/test/mod.rs
+index 592d5aa..e85cabd 100644
+--- a/term/src/test/mod.rs
++++ b/term/src/test/mod.rs
+@@ -499,6 +499,147 @@ fn issue_1161() {
+     );
+ }
+ 
++#[test]
++fn paragraph_bidi_soft_wrap_context() {
++    use wezterm_bidi::{BidiContext, ParagraphDirectionHint};
++    let mut term = TestTerm::new(5, 6, 10);
++    let text = "سلام  (abc) دنیا";
++    term.print(text);
++    let hint = ParagraphDirectionHint::AutoLeftToRight;
++    term.screen_mut()
++        .for_each_phys_line_mut(|_, line| line.set_bidi_info(true, hint, 1));
++    let chars: Vec<char> = text.chars().collect();
++    let mut context = BidiContext::new();
++    context.resolve_paragraph(&chars, hint);
++    let expected: Vec<_> = context
++        .reordered_runs(6..12)
++        .into_iter()
++        .map(|run| (chars[run.range].iter().collect::<String>(), run.direction))
++        .collect();
++    term.screen_mut().with_phys_lines_mut(1..2, |lines| {
++        let actual: Vec<_> = lines[0]
++            .cluster(Some(hint))
++            .into_iter()
++            .map(|run| (run.text, run.direction))
++            .collect();
++        assert_eq!(actual, expected);
++    });
++}
++
++#[test]
++fn paragraph_bidi_hard_newline_and_reflow() {
++    use wezterm_bidi::{BidiContext, ParagraphDirectionHint};
++    let hint = ParagraphDirectionHint::AutoLeftToRight;
++    let mut term = TestTerm::new(20, 6, 100);
++    term.print("سلام  (abc) دنیا 123 می\u{200c}خواهم\r\nEnglish (فارسی) 42!\r\nمستعمرهنشینان");
++    term.screen_mut()
++        .for_each_phys_line_mut(|_, line| line.set_bidi_info(true, hint, 1));
++    for cols in [6, 11, 8, 40, 7] {
++        term.resize(TerminalSize {
++            rows: 20,
++            cols,
++            pixel_width: 0,
++            pixel_height: 0,
++            dpi: 96,
++        });
++        let count = term.screen().scrollback_rows();
++        term.screen_mut().with_phys_lines_mut(0..count, |rows| {
++            let mut start = 0;
++            while start < rows.len() {
++                let mut end = start + 1;
++                while end < rows.len() && rows[end - 1].last_cell_was_wrapped() {
++                    end += 1;
++                }
++                let mut chars = vec![];
++                let mut ranges = vec![];
++                for row in &rows[start..end] {
++                    assert!(row.bidi_info().0, "bidi lost on resize");
++                    let first = chars.len();
++                    for cell in row.visible_cells() {
++                        chars.extend(cell.str().chars());
++                    }
++                    ranges.push(first..chars.len());
++                }
++                let mut context = BidiContext::new();
++                context.resolve_paragraph(&chars, hint);
++                for (row, range) in rows[start..end].iter().zip(ranges) {
++                    assert_eq!(
++                        row.resolved_bidi_direction(),
++                        context.base_level().direction()
++                    );
++                    let expected: String = context
++                        .reordered_runs(range)
++                        .into_iter()
++                        .map(|r| chars[r.range].iter().collect::<String>())
++                        .collect();
++                    let actual: String = row
++                        .cluster(Some(hint))
++                        .iter()
++                        .map(|c| c.text.as_str())
++                        .collect();
++                    assert_eq!(actual, expected, "width {cols}");
++                    assert_eq!(
++                        row.cluster(Some(hint))
++                            .iter()
++                            .map(|c| c.width)
++                            .sum::<usize>(),
++                        row.visible_cells().map(|c| c.width()).sum::<usize>()
++                    );
++                }
++                start = end;
++            }
++        });
++    }
++}
++
++#[test]
++fn paragraph_bidi_context_change_invalidates_shape_hash() {
++    use wezterm_bidi::ParagraphDirectionHint;
++    let hint = ParagraphDirectionHint::AutoLeftToRight;
++    let mut term = TestTerm::new(5, 6, 10);
++    term.print("سلام  (abc) دنیا");
++    term.screen_mut()
++        .for_each_phys_line_mut(|_, line| line.set_bidi_info(true, hint, 1));
++    let mut before = [0; 16];
++    let mut seqno = 0;
++    term.screen_mut().with_phys_lines_mut(1..2, |rows| {
++        before = rows[0].compute_shape_hash();
++        seqno = rows[0].current_seqno();
++    });
++    term.screen_mut()
++        .line_mut(0)
++        .set_cell(0, Cell::new('A', CellAttributes::default()), 2);
++    term.screen_mut().with_phys_lines_mut(1..2, |rows| {
++        assert_ne!(
++            rows[0].compute_shape_hash(),
++            before,
++            "unchanged row must see edited paragraph context"
++        );
++        assert_eq!(rows[0].current_seqno(), seqno);
++    });
++}
++
++#[test]
++fn paragraph_bidi_retains_long_offscreen_context() {
++    use wezterm_bidi::{Direction, ParagraphDirectionHint};
++    let mut term = TestTerm::new(5, 8, 400);
++    term.print(format!("سلام  {}", "abcdefgh".repeat(240)));
++    term.screen_mut().for_each_phys_line_mut(|_, line| {
++        line.set_bidi_info(true, ParagraphDirectionHint::AutoLeftToRight, 1)
++    });
++    term.screen_mut().with_phys_lines_mut(200..201, |rows| {
++        assert_eq!(rows[0].resolved_bidi_direction(), Direction::RightToLeft);
++        assert_eq!(
++            rows[0]
++                .cluster(Some(ParagraphDirectionHint::AutoLeftToRight))
++                .iter()
++                .map(|c| c.width)
++                .sum::<usize>(),
++            8
++        );
++    });
++}
++
+ #[test]
+ fn basic_output() {
+     let mut term = TestTerm::new(5, 10, 0);
 diff --git a/wezterm-font/src/shaper/harfbuzz.rs b/wezterm-font/src/shaper/harfbuzz.rs
 index e323e60..10a298a 100644
 --- a/wezterm-font/src/shaper/harfbuzz.rs
@@ -222,10 +499,18 @@ index f867494..73481c6 100644
                  AllowSquareGlyphOverflow::Never => false,
                  AllowSquareGlyphOverflow::Always => true,
 diff --git a/wezterm-gui/src/shapecache.rs b/wezterm-gui/src/shapecache.rs
-index e01ea4d..c30d4bf 100644
+index e01ea4d..176a93e 100644
 --- a/wezterm-gui/src/shapecache.rs
 +++ b/wezterm-gui/src/shapecache.rs
-@@ -18,6 +18,7 @@ pub struct GlyphPosition {
+@@ -9,6 +9,7 @@ use wezterm_font::units::*;
+ pub struct ShapeCacheKey {
+     pub style: TextStyle,
+     pub text: String,
++    pub rtl: bool,
+ }
+ 
+ #[derive(Debug, PartialEq)]
+@@ -18,11 +19,13 @@ pub struct GlyphPosition {
      pub x_offset: PixelLength,
      pub bearing_x: f32,
      pub bitmap_pixel_width: u32,
@@ -233,7 +518,21 @@ index e01ea4d..c30d4bf 100644
  }
  
  #[derive(Debug)]
-@@ -42,6 +43,7 @@ impl ShapedInfo {
+ pub struct ShapedInfo {
+     pub glyph: Rc<CachedGlyph>,
++    pub cluster: u32,
+     pub pos: GlyphPosition,
+     pub block_key: Option<BlockKey>,
+ }
+@@ -35,6 +38,7 @@ impl ShapedInfo {
+ 
+         for (info, glyph) in infos.iter().zip(glyphs.iter()) {
+             pos.push(ShapedInfo {
++                cluster: info.cluster,
+                 pos: GlyphPosition {
+                     glyph_idx: info.glyph_pos,
+                     bitmap_pixel_width: glyph
+@@ -42,6 +46,7 @@ impl ShapedInfo {
                          .as_ref()
                          .map_or(0, |t| t.coords.width() as u32),
                      num_cells: info.num_cells,
@@ -241,7 +540,53 @@ index e01ea4d..c30d4bf 100644
                      x_offset: info.x_offset,
                      bearing_x: glyph.bearing_x.get() as f32,
                  },
-@@ -228,6 +230,7 @@ mod test {
+@@ -62,6 +67,7 @@ impl ShapedInfo {
+ pub struct BorrowedShapeCacheKey<'a> {
+     pub style: &'a TextStyle,
+     pub text: &'a str,
++    pub rtl: bool,
+ }
+ 
+ impl<'a> BorrowedShapeCacheKey<'a> {
+@@ -69,6 +75,7 @@ impl<'a> BorrowedShapeCacheKey<'a> {
+         ShapeCacheKey {
+             style: self.style.clone(),
+             text: self.text.to_owned(),
++            rtl: self.rtl,
+         }
+     }
+ }
+@@ -82,6 +89,7 @@ impl ShapeCacheKeyTrait for ShapeCacheKey {
+         BorrowedShapeCacheKey {
+             style: &self.style,
+             text: &self.text,
++            rtl: self.rtl,
+         }
+     }
+ }
+@@ -186,6 +194,21 @@ mod test {
+             .collect()
+     }
+ 
++    #[test]
++    fn directional_shape_cache_keys_are_distinct() {
++        use super::{BorrowedShapeCacheKey, ShapeCacheKeyTrait};
++        let style = TextStyle::default();
++        let ltr = BorrowedShapeCacheKey {
++            style: &style,
++            text: "(123)",
++            rtl: false,
++        };
++        let rtl = BorrowedShapeCacheKey { rtl: true, ..ltr };
++        assert_ne!(ltr, rtl);
++        assert_eq!(rtl.to_owned().key(), rtl);
++        assert_eq!(ltr.to_owned().key(), ltr);
++    }
++
+     #[test]
+     fn ligatures_fira() {
+         config::use_test_configuration();
+@@ -228,6 +251,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 1.0,
          bitmap_pixel_width: 8,
@@ -249,7 +594,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 1742,
-@@ -235,6 +238,7 @@ mod test {
+@@ -235,6 +259,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 0,
@@ -257,7 +602,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 1742,
-@@ -242,6 +246,7 @@ mod test {
+@@ -242,6 +267,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 0,
@@ -265,7 +610,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 896,
-@@ -249,6 +254,7 @@ mod test {
+@@ -249,6 +275,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: -15.0,
          bitmap_pixel_width: 20,
@@ -273,7 +618,7 @@ index e01ea4d..c30d4bf 100644
      },
  ]
  "
-@@ -337,6 +343,7 @@ mod test {
+@@ -337,6 +364,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 1.0,
          bitmap_pixel_width: 8,
@@ -281,7 +626,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 214,
-@@ -344,6 +351,7 @@ mod test {
+@@ -344,6 +372,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 1.0,
          bitmap_pixel_width: 8,
@@ -289,7 +634,7 @@ index e01ea4d..c30d4bf 100644
      },
  ]
  "
-@@ -359,6 +367,7 @@ mod test {
+@@ -359,6 +388,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 1.0,
          bitmap_pixel_width: 8,
@@ -297,7 +642,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 958,
-@@ -366,6 +375,7 @@ mod test {
+@@ -366,6 +396,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 0,
@@ -305,7 +650,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 214,
-@@ -373,6 +383,7 @@ mod test {
+@@ -373,6 +404,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 1.0,
          bitmap_pixel_width: 8,
@@ -313,7 +658,7 @@ index e01ea4d..c30d4bf 100644
      },
  ]
  "
-@@ -388,6 +399,7 @@ mod test {
+@@ -388,6 +420,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 1.0,
          bitmap_pixel_width: 8,
@@ -321,7 +666,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 1742,
-@@ -395,6 +407,7 @@ mod test {
+@@ -395,6 +428,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 0,
@@ -329,7 +674,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 1742,
-@@ -402,6 +415,7 @@ mod test {
+@@ -402,6 +436,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 0,
@@ -337,7 +682,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 896,
-@@ -409,6 +423,7 @@ mod test {
+@@ -409,6 +444,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: -15.0,
          bitmap_pixel_width: 20,
@@ -345,7 +690,7 @@ index e01ea4d..c30d4bf 100644
      },
  ]
  "
-@@ -424,6 +439,7 @@ mod test {
+@@ -424,6 +460,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 1.0,
          bitmap_pixel_width: 8,
@@ -353,7 +698,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 860,
-@@ -431,6 +447,7 @@ mod test {
+@@ -431,6 +468,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 9,
@@ -361,7 +706,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 290,
-@@ -438,6 +455,7 @@ mod test {
+@@ -438,6 +476,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 1.0,
          bitmap_pixel_width: 8,
@@ -369,7 +714,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 320,
-@@ -445,6 +463,7 @@ mod test {
+@@ -445,6 +484,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 1.0,
          bitmap_pixel_width: 8,
@@ -377,7 +722,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 860,
-@@ -452,6 +471,7 @@ mod test {
+@@ -452,6 +492,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 9,
@@ -385,7 +730,7 @@ index e01ea4d..c30d4bf 100644
      },
  ]
  "
-@@ -467,6 +487,7 @@ mod test {
+@@ -467,6 +508,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 1.0,
          bitmap_pixel_width: 8,
@@ -393,7 +738,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 958,
-@@ -474,6 +495,7 @@ mod test {
+@@ -474,6 +516,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 0,
@@ -401,7 +746,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 958,
-@@ -481,6 +503,7 @@ mod test {
+@@ -481,6 +524,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 0,
@@ -409,7 +754,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 214,
-@@ -488,6 +511,7 @@ mod test {
+@@ -488,6 +532,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 1.0,
          bitmap_pixel_width: 8,
@@ -417,7 +762,7 @@ index e01ea4d..c30d4bf 100644
      },
  ]
  "
-@@ -503,6 +527,7 @@ mod test {
+@@ -503,6 +548,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 0,
@@ -425,7 +770,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 1588,
-@@ -510,6 +535,7 @@ mod test {
+@@ -510,6 +556,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: -9.0,
          bitmap_pixel_width: 17,
@@ -433,7 +778,7 @@ index e01ea4d..c30d4bf 100644
      },
  ]
  "
-@@ -525,6 +551,7 @@ mod test {
+@@ -525,6 +572,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 0,
@@ -441,7 +786,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 1613,
-@@ -532,6 +559,7 @@ mod test {
+@@ -532,6 +580,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: -8.0,
          bitmap_pixel_width: 16,
@@ -449,7 +794,7 @@ index e01ea4d..c30d4bf 100644
      },
  ]
  "
-@@ -547,6 +575,7 @@ mod test {
+@@ -547,6 +596,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 0,
@@ -457,7 +802,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 1742,
-@@ -554,6 +583,7 @@ mod test {
+@@ -554,6 +604,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 0,
@@ -465,7 +810,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 1562,
-@@ -561,6 +591,7 @@ mod test {
+@@ -561,6 +612,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: -18.0,
          bitmap_pixel_width: 27,
@@ -473,7 +818,7 @@ index e01ea4d..c30d4bf 100644
      },
  ]
  "
-@@ -583,6 +614,7 @@ mod test {
+@@ -583,6 +635,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 10,
@@ -481,7 +826,7 @@ index e01ea4d..c30d4bf 100644
      },
  ]
  "
-@@ -605,6 +637,7 @@ mod test {
+@@ -605,6 +658,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: -0.8333333,
          bitmap_pixel_width: 12,
@@ -489,7 +834,7 @@ index e01ea4d..c30d4bf 100644
      },
  ]
  "
-@@ -620,6 +653,7 @@ mod test {
+@@ -620,6 +674,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 0,
@@ -497,7 +842,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 1742,
-@@ -627,6 +661,7 @@ mod test {
+@@ -627,6 +682,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 0,
@@ -505,7 +850,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 1742,
-@@ -634,6 +669,7 @@ mod test {
+@@ -634,6 +690,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 0,
@@ -513,7 +858,7 @@ index e01ea4d..c30d4bf 100644
      },
      GlyphPosition {
          glyph_idx: 1595,
-@@ -641,6 +677,7 @@ mod test {
+@@ -641,6 +698,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: -28.0,
          bitmap_pixel_width: 37,
@@ -521,7 +866,7 @@ index e01ea4d..c30d4bf 100644
      },
  ]
  "
-@@ -667,6 +704,7 @@ mod test {
+@@ -667,6 +725,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 16,
@@ -529,7 +874,7 @@ index e01ea4d..c30d4bf 100644
      },
  ]
  "
-@@ -690,6 +728,7 @@ mod test {
+@@ -690,6 +749,7 @@ mod test {
          x_offset: 0.0,
          bearing_x: 0.0,
          bitmap_pixel_width: 20,
@@ -537,67 +882,291 @@ index e01ea4d..c30d4bf 100644
      },
  ]
  "
+diff --git a/wezterm-gui/src/termwindow/mouseevent.rs b/wezterm-gui/src/termwindow/mouseevent.rs
+index f7fefd0..733cf9c 100644
+--- a/wezterm-gui/src/termwindow/mouseevent.rs
++++ b/wezterm-gui/src/termwindow/mouseevent.rs
+@@ -773,6 +773,31 @@ impl super::TermWindow {
+             .unwrap_or(dims.physical_top)
+             + row as StableRowIndex;
+ 
++        // Selection/hyperlinks use logical cells, not the proportional display
++        // columns. Resolve against the same paragraph + glyph layout as paint.
++        if self.config.bidi_enabled && !self.config.experimental_pixel_positioning {
++            struct FetchLine(Option<Line>);
++            impl WithPaneLines for FetchLine {
++                fn with_lines_mut(&mut self, _: StableRowIndex, lines: &mut [&mut Line]) {
++                    self.0 = lines.first().map(|line| (**line).clone());
++                }
++            }
++            let mut fetch = FetchLine(None);
++            pane.with_lines_mut(stable_row..stable_row + 1, &mut fetch);
++            if let Some(line) = fetch.0 {
++                let x = column as f32 * self.render_metrics.cell_size.width as f32
++                    + x_pixel_offset as f32;
++                match self.bidi_hit_test(&line, &pane.palette(), dims.cols, x) {
++                    Ok(Some((logical, offset))) => {
++                        column = logical;
++                        x_pixel_offset = offset;
++                    }
++                    Err(err) => log::debug!("bidi hit-test: {err:#}"),
++                    Ok(None) => {}
++                }
++            }
++        }
++
+         self.pane_state(pane.pane_id())
+             .mouse_terminal_coords
+             .replace((
+diff --git a/wezterm-gui/src/termwindow/render/mod.rs b/wezterm-gui/src/termwindow/render/mod.rs
+index 1cb777d..4c68d58 100644
+--- a/wezterm-gui/src/termwindow/render/mod.rs
++++ b/wezterm-gui/src/termwindow/render/mod.rs
+@@ -35,6 +35,7 @@ use wezterm_term::{CellAttributes, Line, StableRowIndex};
+ use window::color::LinearRgba;
+ 
+ pub mod borders;
++mod cell_layout;
+ pub mod corners;
+ pub mod draw;
+ pub mod fancy_tab_bar;
+@@ -810,6 +811,7 @@ impl crate::TermWindow {
+         let key = BorrowedShapeCacheKey {
+             style,
+             text: &cluster.text,
++            rtl: cluster.direction == wezterm_bidi::Direction::RightToLeft,
+         };
+         let glyph_info = match self.lookup_cached_shape(&key) {
+             Some(Ok(info)) => info,
 diff --git a/wezterm-gui/src/termwindow/render/screen_line.rs b/wezterm-gui/src/termwindow/render/screen_line.rs
-index c930e47..3ccfdfa 100644
+index c930e47..9276039 100644
 --- a/wezterm-gui/src/termwindow/render/screen_line.rs
 +++ b/wezterm-gui/src/termwindow/render/screen_line.rs
-@@ -88,7 +88,7 @@ impl crate::TermWindow {
+@@ -1,3 +1,4 @@
++use super::cell_layout::CellLayout;
+ use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
+ use crate::termwindow::render::{
+     resolve_fg_color_attr, same_hyperlink, update_next_frame_time, ClusterStyleCache,
+@@ -19,6 +20,52 @@ use wezterm_term::color::ColorAttribute;
+ use wezterm_term::CellAttributes;
+ 
+ impl crate::TermWindow {
++    pub(crate) fn bidi_hit_test(
++        &self,
++        line: &wezterm_term::Line,
++        palette: &wezterm_term::color::ColorPalette,
++        cols: usize,
++        x: f32,
++    ) -> anyhow::Result<Option<(usize, isize)>> {
++        if !line.bidi_info().0
++            || self.config.experimental_pixel_positioning
++            || self.render_state.is_none()
++        {
++            return Ok(None);
++        }
++        let params = LineToElementParams {
++            config: &self.config,
++            line,
++            palette,
++            window_is_transparent: false,
++            reverse_video: false,
++            shape_key: &None,
++        };
++        let (shaped, _) = self.build_line_element_shape(params)?;
++        let scale = if line.is_single_width() { 1. } else { 2. };
++        let cell_width = self.render_metrics.cell_size.width as f32 * scale;
++        let layout = CellLayout::new(
++            &shaped,
++            cols as f32 * self.render_metrics.cell_size.width as f32,
++            cell_width,
++            scale,
++            line.resolved_bidi_direction(),
++            cols,
++        );
++        Ok(layout.hit(x).map(|col| {
++            let range = layout.cells[col].as_ref().unwrap();
++            let mut fraction =
++                ((x - range.start) / (range.end - range.start).max(0.01)).clamp(0., 1.);
++            if layout.rtl_cells[col] {
++                fraction = 1. - fraction;
++            }
++            (
++                col,
++                (fraction * self.render_metrics.cell_size.width as f32) as isize,
++            )
++        }))
++    }
++
+     /// "Render" a line of the terminal screen into the vertex buffer.
+     /// This is nominally a matter of setting the fg/bg color and the
+     /// texture coordinates for a given glyph.  There's a little bit
+@@ -88,8 +135,12 @@ impl crate::TermWindow {
  
          let mut composition_width = 0;
  
 -        let (_bidi_enabled, bidi_direction) = params.line.bidi_info();
+-        let direction = bidi_direction.direction();
 +        let (bidi_enabled, bidi_direction) = params.line.bidi_info();
-         let direction = bidi_direction.direction();
++        let direction = if bidi_enabled {
++            Direction::LeftToRight
++        } else {
++            bidi_direction.direction()
++        };
  
          // Do we need to shape immediately, or can we use the pre-shaped data?
-@@ -475,6 +475,46 @@ impl crate::TermWindow {
+         if let Some(composing) = composing {
+@@ -110,7 +161,7 @@ impl crate::TermWindow {
+             0..0
+         };
+ 
+-        let cursor_range_pixels = params.left_pixel_x + cursor_range.start as f32 * cell_width
++        let mut cursor_range_pixels = params.left_pixel_x + cursor_range.start as f32 * cell_width
+             ..params.left_pixel_x + cursor_range.end as f32 * cell_width;
+ 
+         let mut shaped = None;
+@@ -155,6 +206,39 @@ impl crate::TermWindow {
+             shaped
+         };
+ 
++        let cell_layout = if bidi_enabled && !params.use_pixel_positioning {
++            Some(CellLayout::new(
++                &shaped,
++                params.pixel_width,
++                cell_width,
++                width_scale,
++                params.line.resolved_bidi_direction(),
++                num_cols,
++            ))
++        } else {
++            None
++        };
++        if let Some(layout) = &cell_layout {
++            if let Some(range) = layout.cursor(cursor_range.clone(), cell_width) {
++                cursor_range_pixels =
++                    params.left_pixel_x + range.start..params.left_pixel_x + range.end;
++            }
++        }
++        let selection_ranges: Vec<Range<f32>> = if let Some(layout) = &cell_layout {
++            layout
++                .range(params.selection.clone())
++                .into_iter()
++                .map(|r| params.left_pixel_x + r.start..params.left_pixel_x + r.end)
++                .collect()
++        } else if !params.selection.is_empty() {
++            vec![
++                params.left_pixel_x + params.selection.start as f32 * cell_width
++                    ..params.left_pixel_x + params.selection.end as f32 * cell_width,
++            ]
++        } else {
++            vec![]
++        };
++
+         let bounding_rect = euclid::rect(
+             params.left_pixel_x,
+             params.top_pixel_y,
+@@ -194,7 +278,7 @@ impl crate::TermWindow {
+         // Need to consider:
+         // * background when it is not the default color
+         // * Reverse video attribute
+-        for item in shaped.iter() {
++        for (item_idx, item) in shaped.iter().enumerate() {
+             let cluster = &item.cluster;
+             let attrs = &cluster.attrs;
+             let cluster_width = cluster.width;
+@@ -229,7 +313,9 @@ impl crate::TermWindow {
+ 
+             if !bg_is_default {
+                 let x = params.left_pixel_x
+-                    + if params.use_pixel_positioning {
++                    + if let Some(layout) = &cell_layout {
++                        layout.spans[item_idx].start
++                    } else if params.use_pixel_positioning {
+                         item.x_pos
+                     } else {
+                         phys(cluster.first_cell_idx, num_cols, direction) as f32 * cell_width
+@@ -265,7 +351,9 @@ impl crate::TermWindow {
+                     let mut quad = layers.allocate(0).context("layers.allocate(0)")?;
+                     let x = gl_x
+                         + params.left_pixel_x
+-                        + if params.use_pixel_positioning {
++                        + if let Some(layout) = &cell_layout {
++                            layout.spans[item_idx].start + i as f32 * cell_width
++                        } else if params.use_pixel_positioning {
+                             item.x_pos
+                         } else {
+                             phys(cluster.first_cell_idx + i, num_cols, direction) as f32
+@@ -284,9 +372,9 @@ impl crate::TermWindow {
+         // Render the selection background color.
+         // This always uses a physical x position, regardles of the line
+         // direction.
+-        let selection_pixel_range = if !params.selection.is_empty() {
+-            let start = params.left_pixel_x + (params.selection.start as f32 * cell_width);
+-            let width = (params.selection.end - params.selection.start) as f32 * cell_width;
++        for range in &selection_ranges {
++            let start = range.start;
++            let width = range.end - range.start;
+             let mut quad = self
+                 .filled_rectangle(
+                     layers,
+@@ -297,11 +385,7 @@ impl crate::TermWindow {
+                 .context("filled_rectangle")?;
+ 
+             quad.set_hsv(hsv);
+-
+-            start..start + width
+-        } else {
+-            0.0..0.0
+-        };
++        }
+ 
+         // Render composition/IME preview background
+         if composition_width > 0 {
+@@ -361,9 +445,7 @@ impl crate::TermWindow {
+                 cursor_border_color: params.cursor_border_color,
+                 pane: params.pane,
+             });
+-            let pos_x = (self.dimensions.pixel_width as f32 / -2.)
+-                + params.left_pixel_x
+-                + (phys(params.cursor.x, num_cols, direction) as f32 * cell_width);
++            let pos_x = (self.dimensions.pixel_width as f32 / -2.) + cursor_range_pixels.start;
+ 
+             if let Some(shape) = cursor_shape {
+                 let cursor_layer = match shape {
+@@ -416,7 +498,7 @@ impl crate::TermWindow {
+                     quad.set_position(
+                         pos_x,
+                         pos_y,
+-                        pos_x + (cursor_range.end - cursor_range.start) as f32 * cell_width,
++                        pos_x + (cursor_range_pixels.end - cursor_range_pixels.start),
+                         pos_y + cell_height,
+                     );
+                     quad.set_texture(
+@@ -447,7 +529,7 @@ impl crate::TermWindow {
+             Direction::RightToLeft => params.pixel_width,
+         };
+ 
+-        for item in shaped.iter() {
++        for (item_idx, item) in shaped.iter().enumerate() {
+             let cluster = &item.cluster;
+             let glyph_info = &item.glyph_info;
+             let images = cluster.attrs.images().unwrap_or_else(|| vec![]);
+@@ -475,7 +557,14 @@ impl crate::TermWindow {
                  };
              }
  
-+            // RTL runs (Arabic, Persian, Hebrew...) are shaped into glyphs
-+            // whose advances don't match the fixed cell width. Forcing each
-+            // glyph into a cell slot breaks cursive joining. For such runs
-+            // we place glyphs using their real advances, right-justified
-+            // within the run's cell span. The run still occupies exactly
-+            // `cluster.width` cells, so cursor, selection and column
-+            // alignment are unaffected.
-+            let rtl_proportional = bidi_enabled
-+                && !params.use_pixel_positioning
-+                && cluster.direction == Direction::RightToLeft;
-+            let cluster_start_x = cluster_x_pos;
-+            let mut cluster_span = cluster.width as f32 * cell_width;
-+            if rtl_proportional && direction == Direction::LeftToRight {
-+                // Never extend past the right edge of the line, even if the
-+                // cluster is counted as wider than the remaining cells.
-+                cluster_span = cluster_span.min((params.pixel_width - cluster_start_x).max(0.));
-+            }
-+            // Spare room (cell span minus real glyph widths) is spread over
-+            // the spaces between words so letters keep touching each other.
-+            // A run without spaces is simply right-justified in its span.
-+            let mut space_extra = 0.;
-+            // When the shaped run is wider than its cell span, compress the
-+            // advances so that the run fits instead of spilling over (and
-+            // being clipped at) the edge.
-+            let mut advance_scale = 1.;
-+            if rtl_proportional {
-+                let natural_width = item.pixel_width * width_scale;
-+                if natural_width > cluster_span && natural_width > 0. {
-+                    advance_scale = cluster_span / natural_width;
-+                }
-+                let slack = (cluster_span - natural_width).max(0.);
-+                let spaces = glyph_info.iter().filter(|i| i.pos.is_space).count();
-+                if spaces > 0 {
-+                    space_extra = slack / spaces as f32;
-+                } else {
-+                    cluster_x_pos += slack;
-+                }
-+            }
+-            for info in glyph_info.iter() {
++            let rtl_proportional =
++                cell_layout.is_some() && cluster.direction == Direction::RightToLeft;
 +            let pixel_glyphs = params.use_pixel_positioning || rtl_proportional;
 +
-             for info in glyph_info.iter() {
++            for (glyph_idx_in_run, info) in glyph_info.iter().enumerate() {
++                if let Some(layout) = &cell_layout {
++                    cluster_x_pos = layout.glyph_x[item_idx][glyph_idx_in_run];
++                }
                  let glyph = &info.glyph;
  
-@@ -531,13 +571,15 @@ impl crate::TermWindow {
+                 if params.use_pixel_positioning
+@@ -531,13 +620,15 @@ impl crate::TermWindow {
                          // TODO: clipping, but we can do that based on pixels
  
                          let pos_x = cluster_x_pos
@@ -615,37 +1184,303 @@ index c930e47..3ccfdfa 100644
                              log::trace!("breaking on overflow {} > {}", pos_x, params.pixel_width);
                              break;
                          }
-@@ -696,13 +738,23 @@ impl crate::TermWindow {
+@@ -551,73 +642,43 @@ impl crate::TermWindow {
+                         // for the cursor/selection/regular background upon which
+                         // it will be drawn.
+ 
+-                        /// Computes the intersection between r1 and r2.
+-                        /// It may be empty.
+-                        fn intersection(r1: &Range<f32>, r2: &Range<f32>) -> Range<f32> {
+-                            let start = r1.start.max(r2.start);
+-                            let end = r1.end.min(r2.end);
+-                            if end > start {
+-                                start..end
+-                            } else {
+-                                // Empty
+-                                start..start
+-                            }
+-                        }
++                        // Pixel-positioned glyphs already have their offset applied.
++                        let adjust = if pixel_glyphs {
++                            0.
++                        } else {
++                            (glyph.x_offset + glyph.bearing_x).get() as f32
++                        };
++                        let texture_range = (pos_x + adjust).max(params.left_pixel_x)
++                            ..(pos_x + adjust + texture.coords.size.width as f32 * width_scale)
++                                .min(params.left_pixel_x + params.pixel_width);
+ 
+-                        /// Assess range `r` relative to `within`. If `r` intersects
+-                        /// `within` then return the 3 ranges that are subsets of `r`
+-                        /// which are to the left of `within`, intersecting `within`
+-                        /// and to the right of `within`.
+-                        /// If `r` and `within` do not intersect, returns `r` and
+-                        /// two empty ranges.
+-                        /// If `r` is itself an empty range, all returned ranges
+-                        /// will be empty.
+-                        fn range3(
+-                            r: &Range<f32>,
+-                            within: &Range<f32>,
+-                        ) -> (Range<f32>, Range<f32>, Range<f32>) {
+-                            if r.is_empty() {
+-                                return (r.clone(), r.clone(), r.clone());
+-                            }
+-                            let i = intersection(r, within);
+-                            if i.is_empty() {
+-                                return (r.clone(), i.clone(), i.clone());
++                        // A logical selection may cover disjoint visual spans.
++                        let mut cuts = if texture_range.is_empty() {
++                            vec![]
++                        } else {
++                            vec![texture_range.start, texture_range.end]
++                        };
++                        for selected in selection_ranges
++                            .iter()
++                            .chain(std::iter::once(&cursor_range_pixels))
++                        {
++                            for edge in [selected.start, selected.end] {
++                                if texture_range.contains(&edge) {
++                                    cuts.push(edge);
++                                }
+                             }
+-
+-                            let left = if i.start > r.start {
+-                                r.start..i.start
+-                            } else {
+-                                r.start..r.start
+-                            };
+-
+-                            let right = if i.end < r.end {
+-                                i.end..r.end
+-                            } else {
+-                                r.end..r.end
+-                            };
+-
+-                            (left, i, right)
+                         }
+-
+-                        let adjust = (glyph.x_offset + glyph.bearing_x).get() as f32;
+-                        let texture_range = pos_x + adjust
+-                            ..pos_x + adjust + (texture.coords.size.width as f32 * width_scale);
+-
+-                        // First bucket the ranges according to cursor position
+-                        let (left, mid, right) = range3(&texture_range, &cursor_range_pixels);
+-                        // Then sub-divide the non-cursor ranges according to selection
+-                        let (la, lb, lc) = range3(&left, &selection_pixel_range);
+-                        let (ra, rb, rc) = range3(&right, &selection_pixel_range);
+-
+-                        // and render each of these strips
+-                        for range in [la, lb, lc, mid, ra, rb, rc] {
++                        cuts.sort_by(f32::total_cmp);
++                        cuts.dedup();
++                        for strip in cuts.windows(2) {
++                            let range = strip[0]..strip[1];
+                             if range.is_empty() {
+                                 continue;
+                             }
+ 
+                             let is_cursor = cursor_range_pixels.contains(&range.start);
+-                            let selected =
+-                                !is_cursor && selection_pixel_range.contains(&range.start);
++                            let selected = !is_cursor
++                                && selection_ranges.iter().any(|r| r.contains(&range.start));
+ 
+                             let ComputeCellFgBgResult {
+                                 fg_color: glyph_color,
+@@ -696,13 +757,18 @@ impl crate::TermWindow {
                      phys_cell_idx += info.pos.num_cells as usize;
                  }
                  visual_cell_idx += info.pos.num_cells as usize;
 -                cluster_x_pos += if params.use_pixel_positioning {
--                    glyph.x_advance.get() as f32 * width_scale
 +                cluster_x_pos += if pixel_glyphs {
-+                    glyph.x_advance.get() as f32 * width_scale * advance_scale
-+                        + if rtl_proportional && info.pos.is_space {
-+                            space_extra
-+                        } else {
-+                            0.
-+                        }
+                     glyph.x_advance.get() as f32 * width_scale
                  } else {
                      info.pos.num_cells as f32 * cell_width
                  };
              }
  
-+            if rtl_proportional {
++            if let Some(layout) = &cell_layout {
 +                // Snap back to the cell grid for whatever follows
-+                cluster_x_pos = cluster_start_x + cluster_span;
++                cluster_x_pos = layout.spans[item_idx].end;
 +            }
 +
              match direction {
                  Direction::RightToLeft => {
                      // And decrement it again
+diff --git a/wezterm-surface/src/cellcluster.rs b/wezterm-surface/src/cellcluster.rs
+index 26b30e0..13afd5c 100644
+--- a/wezterm-surface/src/cellcluster.rs
++++ b/wezterm-surface/src/cellcluster.rs
+@@ -8,6 +8,15 @@ extern crate alloc;
+ use alloc::string::String;
+ use alloc::vec;
+ use alloc::vec::Vec;
++use core::ops::Range;
++
++/// Resolved paragraph context for a physical row. Ranges are row-local
++/// codepoint offsets in visual left-to-right order, never reordered bytes.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct BidiLine {
++    pub direction: Direction,
++    pub runs: Vec<(Range<usize>, Direction)>,
++}
+ 
+ /// A `CellCluster` is another representation of a Line.
+ /// A `Vec<CellCluster>` is produced by walking through the Cells in
+@@ -27,6 +36,46 @@ pub struct CellCluster {
+ }
+ 
+ impl CellCluster {
++    pub fn make_cluster_resolved<'a>(
++        hint: usize,
++        iter: impl Iterator<Item = CellRef<'a>>,
++        bidi: &BidiLine,
++    ) -> Vec<CellCluster> {
++        let cells: Vec<_> = iter.collect();
++        let mut codepoints = Vec::new();
++        for (idx, cell) in cells.iter().enumerate() {
++            for _ in cell.str().chars() {
++                codepoints.push(idx);
++            }
++        }
++        let mut result = Vec::new();
++        for (range, direction) in &bidi.runs {
++            let mut previous = None;
++            let selected = range.clone().filter_map(|cp| {
++                let idx = *codepoints.get(cp)?;
++                if previous == Some(idx) {
++                    return None;
++                }
++                previous = Some(idx);
++                Some(cells[idx])
++            });
++            let mut fragments = Self::make_cluster_impl(
++                hint,
++                selected,
++                Some(ParagraphDirectionHint::LeftToRight),
++                false,
++            );
++            if *direction == Direction::RightToLeft {
++                fragments.reverse();
++            }
++            for mut fragment in fragments {
++                fragment.direction = *direction;
++                result.push(fragment);
++            }
++        }
++        result
++    }
++
+     /// Given a byte index into `self.text`, return the corresponding
+     /// cell index in the originating line.
+     pub fn byte_to_cell_idx(&self, byte_idx: usize) -> usize {
+@@ -51,6 +100,15 @@ impl CellCluster {
+         hint: usize,
+         iter: impl Iterator<Item = CellRef<'a>>,
+         bidi_hint: Option<ParagraphDirectionHint>,
++    ) -> Vec<CellCluster> {
++        Self::make_cluster_impl(hint, iter, bidi_hint, true)
++    }
++
++    fn make_cluster_impl<'a>(
++        hint: usize,
++        iter: impl Iterator<Item = CellRef<'a>>,
++        bidi_hint: Option<ParagraphDirectionHint>,
++        resolve: bool,
+     ) -> Vec<CellCluster> {
+         let mut last_cluster = None;
+         let mut clusters = Vec::new();
+@@ -152,7 +210,7 @@ impl CellCluster {
+             clusters.push(cluster);
+         }
+ 
+-        if let Some(hint) = bidi_hint {
++        if let Some(hint) = bidi_hint.filter(|_| resolve) {
+             let mut resolved_clusters = vec![];
+ 
+             let mut context = BidiContext::new();
 diff --git a/wezterm-surface/src/line/line.rs b/wezterm-surface/src/line/line.rs
-index 7c7bb32..98e9a17 100644
+index 7c7bb32..1dfbd06 100644
 --- a/wezterm-surface/src/line/line.rs
 +++ b/wezterm-surface/src/line/line.rs
-@@ -212,6 +212,9 @@ impl Line {
+@@ -1,4 +1,4 @@
+-use crate::cellcluster::CellCluster;
++use crate::cellcluster::{BidiLine, CellCluster};
+ use crate::hyperlink::Rule;
+ use crate::line::cellref::CellRef;
+ use crate::line::clusterline::ClusteredLine;
+@@ -48,6 +48,8 @@ pub struct Line {
+     zones: Vec<ZoneRange>,
+     seqno: SequenceNo,
+     bits: LineBits,
++    #[cfg_attr(feature = "use_serde", serde(skip))]
++    paragraph_bidi: Option<BidiLine>,
+     #[cfg(feature = "appdata")]
+     #[cfg_attr(feature = "use_serde", serde(skip))]
+     appdata: Mutex<Option<Weak<dyn Any + Send + Sync>>>,
+@@ -60,6 +62,7 @@ impl Clone for Line {
+             zones: self.zones.clone(),
+             seqno: self.seqno,
+             bits: self.bits,
++            paragraph_bidi: self.paragraph_bidi.clone(),
+             #[cfg(feature = "appdata")]
+             appdata: Mutex::new(self.appdata.lock().unwrap().clone()),
+         }
+@@ -84,6 +87,7 @@ impl Line {
+             zones: vec![],
+             #[cfg(feature = "appdata")]
+             appdata: Mutex::new(None),
++            paragraph_bidi: None,
+         }
+     }
+ 
+@@ -96,6 +100,7 @@ impl Line {
+             zones: vec![],
+             #[cfg(feature = "appdata")]
+             appdata: Mutex::new(None),
++            paragraph_bidi: None,
+         }
+     }
+ 
+@@ -111,6 +116,7 @@ impl Line {
+             zones: vec![],
+             #[cfg(feature = "appdata")]
+             appdata: Mutex::new(None),
++            paragraph_bidi: None,
+         }
+     }
+ 
+@@ -125,6 +131,13 @@ impl Line {
+     pub fn compute_shape_hash(&self) -> [u8; 16] {
+         let mut hasher = SipHasher::new();
+         self.bits.bits().hash(&mut hasher);
++        if let Some(bidi) = &self.paragraph_bidi {
++            (bidi.direction == Direction::RightToLeft).hash(&mut hasher);
++            for (range, direction) in &bidi.runs {
++                range.hash(&mut hasher);
++                (*direction == Direction::RightToLeft).hash(&mut hasher);
++            }
++        }
+         for cell in self.visible_cells() {
+             cell.compute_shape_hash(&mut hasher);
+         }
+@@ -142,6 +155,7 @@ impl Line {
+             zones: vec![],
+             #[cfg(feature = "appdata")]
+             appdata: Mutex::new(None),
++            paragraph_bidi: None,
+         }
+     }
+ 
+@@ -169,6 +183,7 @@ impl Line {
+             zones: vec![],
+             #[cfg(feature = "appdata")]
+             appdata: Mutex::new(None),
++            paragraph_bidi: None,
+         }
+     }
+ 
+@@ -212,6 +227,9 @@ impl Line {
      /// Wrap the line so that it fits within the provided width.
      /// Returns the list of resultant line(s)
      pub fn wrap(self, width: usize, seqno: SequenceNo) -> Vec<Self> {
@@ -655,7 +1490,7 @@ index 7c7bb32..98e9a17 100644
          let mut cells: Vec<CellRef> = self.visible_cells().collect();
          if let Some(end_idx) = cells.iter().rposition(|c| c.str() != " ") {
              cells.truncate(end_idx + 1);
-@@ -227,7 +230,9 @@ impl Line {
+@@ -227,7 +245,9 @@ impl Line {
                      lines
                          .last_mut()
                          .map(|line| line.set_last_cell_was_wrapped(true, seqno));
@@ -666,3 +1501,373 @@ index 7c7bb32..98e9a17 100644
                      delta = cell.cell_index();
                  }
                  let line = lines.last_mut().unwrap();
+@@ -293,6 +313,10 @@ impl Line {
+     /// manage caching and rendering
+     #[inline]
+     pub fn update_last_change_seqno(&mut self, seqno: SequenceNo) {
++        if self.paragraph_bidi.take().is_some() {
++            #[cfg(feature = "appdata")]
++            self.clear_appdata();
++        }
+         self.seqno = self.seqno.max(seqno);
+     }
+ 
+@@ -655,6 +679,7 @@ impl Line {
+             zones: vec![],
+             #[cfg(feature = "appdata")]
+             appdata: Mutex::new(None),
++            paragraph_bidi: None,
+         }
+     }
+ 
+@@ -740,6 +765,7 @@ impl Line {
+             zones: vec![],
+             #[cfg(feature = "appdata")]
+             appdata: Mutex::new(None),
++            paragraph_bidi: None,
+         }
+     }
+ 
+@@ -1041,9 +1067,29 @@ impl Line {
+     }
+ 
+     pub fn cluster(&self, bidi_hint: Option<ParagraphDirectionHint>) -> Vec<CellCluster> {
++        if bidi_hint.is_some() {
++            if let Some(bidi) = &self.paragraph_bidi {
++                return CellCluster::make_cluster_resolved(self.len(), self.visible_cells(), bidi);
++            }
++        }
+         CellCluster::make_cluster(self.len(), self.visible_cells(), bidi_hint)
+     }
+ 
++    pub fn set_paragraph_bidi(&mut self, bidi: Option<BidiLine>) {
++        if self.paragraph_bidi != bidi {
++            self.paragraph_bidi = bidi;
++            #[cfg(feature = "appdata")]
++            self.clear_appdata();
++        }
++    }
++
++    pub fn resolved_bidi_direction(&self) -> Direction {
++        self.paragraph_bidi
++            .as_ref()
++            .map(|b| b.direction)
++            .unwrap_or_else(|| self.bidi_info().1.direction())
++    }
++
+     fn make_cells(&mut self) {
+         let cells = match &self.cells {
+             CellStorage::V(_) => return,
+diff --git a/wezterm-surface/src/line/test.rs b/wezterm-surface/src/line/test.rs
+index 657e8a7..89274c3 100644
+--- a/wezterm-surface/src/line/test.rs
++++ b/wezterm-surface/src/line/test.rs
+@@ -291,6 +291,7 @@ Line {
+     bits: LineBits(
+         0x0,
+     ),
++    paragraph_bidi: None,
+     appdata: Mutex {
+         data: None,
+         poisoned: false,
+@@ -603,6 +604,7 @@ Line {
+     bits: LineBits(
+         0x0,
+     ),
++    paragraph_bidi: None,
+     appdata: Mutex {
+         data: None,
+         poisoned: false,
+diff --git a/wezterm-gui/src/termwindow/render/cell_layout.rs b/wezterm-gui/src/termwindow/render/cell_layout.rs
+new file mode 100644
+index 0000000..2bfd48a
+--- /dev/null
++++ b/wezterm-gui/src/termwindow/render/cell_layout.rs
+@@ -0,0 +1,287 @@
++//! Pixel geometry for bidi rendering and its inverse mouse/cursor mapping.
++//! Cell indices stay logical; only the display geometry is proportional.
++use super::LineToElementShape;
++use std::ops::Range;
++use wezterm_bidi::Direction;
++
++/// Slack stays at the leading edge, never inside words or spaces. On
++/// overflow compress advances only (the Arabic glyph bitmaps keep their size).
++pub(super) fn rtl_run_metrics(span: f32, natural: f32) -> (f32, f32) {
++    let scale = if natural > span && natural > 0. {
++        span / natural
++    } else {
++        1.
++    };
++    ((span - natural).max(0.), scale)
++}
++
++#[derive(Debug)]
++pub(super) struct CellLayout {
++    pub glyph_x: Vec<Vec<f32>>,
++    pub spans: Vec<Range<f32>>,
++    pub cells: Vec<Option<Range<f32>>>,
++    pub rtl_cells: Vec<bool>,
++}
++
++impl CellLayout {
++    pub fn new(
++        shaped: &[LineToElementShape],
++        width: f32,
++        cell_width: f32,
++        width_scale: f32,
++        base: Direction,
++        num_cols: usize,
++    ) -> Self {
++        let total: usize = shaped.iter().map(|s| s.cluster.width).sum();
++        let mut x = if base == Direction::RightToLeft {
++            (width - total as f32 * cell_width).max(0.)
++        } else {
++            0.
++        };
++        let mut result = Self {
++            glyph_x: vec![],
++            spans: vec![],
++            cells: vec![None; num_cols],
++            rtl_cells: vec![false; num_cols],
++        };
++        for item in shaped {
++            let span = (item.cluster.width as f32 * cell_width).min((width - x).max(0.));
++            let rtl = item.cluster.direction == Direction::RightToLeft;
++            let natural = item.pixel_width * width_scale;
++            let (slack, scale) = if rtl {
++                rtl_run_metrics(span, natural)
++            } else {
++                (0., 1.)
++            };
++            let mut gx = x + slack;
++            let mut positions = vec![];
++            for info in item.glyph_info.iter() {
++                positions.push(gx);
++                let advance = if rtl {
++                    info.glyph.x_advance.get() as f32 * width_scale * scale
++                } else {
++                    info.pos.num_cells as f32 * cell_width
++                };
++                let logical = item.cluster.byte_to_cell_idx(info.cluster as usize);
++                let count = info.pos.num_cells as usize;
++                for n in 0..count {
++                    let visual = if rtl { count - n - 1 } else { n };
++                    let start = gx + advance * visual as f32 / count as f32;
++                    let end = gx + advance * (visual + 1) as f32 / count as f32;
++                    if let Some(cell) = result.cells.get_mut(logical + n) {
++                        *cell = Some(start..end);
++                        result.rtl_cells[logical + n] = rtl;
++                    }
++                }
++                gx += advance;
++            }
++            result.glyph_x.push(positions);
++            result.spans.push(x..x + span);
++            x += span;
++        }
++        result
++    }
++
++    pub fn range(&self, logical: Range<usize>) -> Vec<Range<f32>> {
++        let mut ranges: Vec<_> = logical
++            .filter_map(|idx| self.cells.get(idx)?.clone())
++            .collect();
++        ranges.sort_by(|a, b| a.start.total_cmp(&b.start));
++        let mut merged: Vec<Range<f32>> = vec![];
++        for range in ranges {
++            if let Some(last) = merged.last_mut() {
++                if (last.end - range.start).abs() < 0.01 {
++                    last.end = range.end;
++                    continue;
++                }
++            }
++            merged.push(range);
++        }
++        merged
++    }
++
++    pub fn hit(&self, x: f32) -> Option<usize> {
++        if !self.spans.iter().any(|r| r.contains(&x)) {
++            return None;
++        }
++        self.cells
++            .iter()
++            .enumerate()
++            .filter_map(|(idx, r)| {
++                let r = r.as_ref()?;
++                let distance = if x < r.start {
++                    r.start - x
++                } else if x >= r.end {
++                    x - r.end
++                } else {
++                    0.
++                };
++                Some((idx, distance))
++            })
++            .min_by(|a, b| a.1.total_cmp(&b.1))
++            .map(|(idx, _)| idx)
++    }
++
++    pub fn cursor(&self, logical: Range<usize>, cell_width: f32) -> Option<Range<f32>> {
++        if let Some(range) = self.range(logical.clone()).first() {
++            return Some(range.clone());
++        }
++        let previous = logical.start.checked_sub(1)?;
++        let range = self.cells.get(previous)?.as_ref()?;
++        Some(if self.rtl_cells[previous] {
++            (range.start - cell_width).max(0.)..range.start
++        } else {
++            range.end..range.end + cell_width
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn arabic_natural_advances_and_logical_hit_roundtrip() {
++        use crate::glyphcache::GlyphCache;
++        use crate::shapecache::ShapedInfo;
++        use crate::utilsprites::RenderMetrics;
++        use config::{FontAttributes, TextStyle};
++        use std::rc::Rc;
++        use termwiz::cell::CellAttributes;
++        use termwiz::cellcluster::BidiLine;
++        use termwiz::surface::Line;
++        use wezterm_bidi::{BidiContext, ParagraphDirectionHint};
++        use wezterm_font::{shaper::PresentationWidth, FontConfiguration};
++        config::use_test_configuration();
++        let mut config = (*config::configuration()).clone();
++        config.font = TextStyle {
++            font: vec![FontAttributes::new("Vazirmatn")],
++            foreground: None,
++        };
++        config.font_rules.clear();
++        config.compute_extra_defaults(None);
++        config::use_this_configuration(config);
++        let fonts = Rc::new(FontConfiguration::new(None, 96).unwrap());
++        let metrics = RenderMetrics::new(&fonts).unwrap();
++        let mut cache = GlyphCache::new_in_memory(&fonts, 1024).unwrap();
++        let style = TextStyle::default();
++        let font = fonts.resolve_font(&style).unwrap();
++        for text in [
++            "سلام دنیا این یک آزمایش است",
++            "فایل config.json را (123) ویرایش کن",
++            "می\u{200c}خواهم کتاب\u{200c}ها",
++            "بِسمِ الله",
++            "مستعمرهنشینان",
++            "abc 123 -> xyz",
++        ] {
++            let mut line = Line::from_text(text, &CellAttributes::default(), 1, None);
++            let chars: Vec<char> = text.chars().collect();
++            let mut bidi = BidiContext::new();
++            bidi.resolve_paragraph(&chars, ParagraphDirectionHint::AutoLeftToRight);
++            line.set_paragraph_bidi(Some(BidiLine {
++                direction: bidi.base_level().direction(),
++                runs: bidi
++                    .reordered_runs(0..chars.len())
++                    .into_iter()
++                    .map(|r| (r.range, r.direction))
++                    .collect(),
++            }));
++            let mut shaped = vec![];
++            for cluster in line.cluster(Some(ParagraphDirectionHint::AutoLeftToRight)) {
++                let info = font
++                    .shape(
++                        &cluster.text,
++                        || {},
++                        |_| {},
++                        None,
++                        cluster.direction,
++                        None,
++                        Some(&PresentationWidth::with_cluster(&cluster)),
++                    )
++                    .unwrap();
++                let glyphs: Vec<_> = info
++                    .iter()
++                    .map(|i| {
++                        cache
++                            .cached_glyph(
++                                i,
++                                &style,
++                                false,
++                                &font,
++                                &metrics,
++                                cluster.byte_to_cell_width(i.cluster as usize),
++                            )
++                            .unwrap()
++                    })
++                    .collect();
++                let glyph_info = Rc::new(ShapedInfo::process(&info, &glyphs));
++                shaped.push(LineToElementShape {
++                    underline_tex_rect: window::bitmaps::TextureRect::default(),
++                    fg_color: window::color::LinearRgba::default(),
++                    bg_color: window::color::LinearRgba::default(),
++                    underline_color: window::color::LinearRgba::default(),
++                    x_pos: 0.,
++                    pixel_width: glyph_info
++                        .iter()
++                        .map(|i| i.glyph.x_advance.get() as f32)
++                        .sum(),
++                    glyph_info,
++                    cluster,
++                });
++            }
++            let cw = metrics.cell_size.width as f32;
++            let layout = CellLayout::new(
++                &shaped,
++                100. * cw,
++                cw,
++                1.,
++                bidi.base_level().direction(),
++                100,
++            );
++            for cell in line.visible_cells() {
++                for logical in cell.cell_index()..cell.cell_index() + cell.width() {
++                    let r = layout.cells[logical]
++                        .as_ref()
++                        .unwrap_or_else(|| panic!("missing {} in {:?}", logical, text));
++                    if r.end > r.start {
++                        assert_eq!(
++                            layout.hit((r.start + r.end) / 2.),
++                            Some(logical),
++                            "{text:?}"
++                        );
++                    }
++                }
++            }
++            for (run, item) in shaped.iter().enumerate() {
++                if item.cluster.direction != Direction::RightToLeft {
++                    continue;
++                }
++                if item.pixel_width <= item.cluster.width as f32 * cw {
++                    for i in 1..item.glyph_info.len() {
++                        let step = layout.glyph_x[run][i] - layout.glyph_x[run][i - 1];
++                        let expected = item.glyph_info[i - 1].glyph.x_advance.get() as f32;
++                        assert!(
++                            (step - expected).abs() < 0.01,
++                            "space/letter advance altered: {:?}",
++                            text
++                        );
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn logical_selection_can_have_disjoint_visual_spans() {
++        let layout = CellLayout {
++            glyph_x: vec![],
++            spans: vec![10.0..25.0],
++            cells: vec![Some(20.0..25.0), Some(10.0..15.0), Some(15.0..20.0)],
++            rtl_cells: vec![false, true, false],
++        };
++        assert_eq!(layout.range(0..2), vec![10.0..15.0, 20.0..25.0]);
++        assert_eq!(layout.range(0..3), vec![10.0..25.0]);
++        assert_eq!(layout.hit(22.), Some(0));
++        assert_eq!(layout.hit(11.), Some(1));
++        assert_eq!(layout.hit(18.), Some(2));
++    }
++}

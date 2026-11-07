@@ -1,0 +1,180 @@
+diff --git a/wezterm-surface/examples/visual-arrow.rs b/wezterm-surface/examples/visual-arrow.rs
+new file mode 100644
+index 0000000..4702f5e
+--- /dev/null
++++ b/wezterm-surface/examples/visual-arrow.rs
+@@ -0,0 +1,174 @@
++//! Readline adapter: report a character offset, never alter input or terminal state.
++use finl_unicode::grapheme_clusters::Graphemes;
++use std::io::{self, Read};
++use wezterm_bidi::{BidiContext, ParagraphDirectionHint};
++use wezterm_cell::grapheme_column_width;
++
++// Block-cursor semantics: each input grapheme is a stop; the extra blank is the
++// logical end stop. Within a row, visual order agrees with CellLayout's monotonic
++// per-run geometry, including proportional Arabic and split ligature cells.
++fn neighbor(text: &str, point: usize, right: bool, cols: usize) -> Option<usize> {
++    if cols < 2
++        || text.len() > 65536
++        || text.chars().any(|c| {
++            c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
++        })
++    {
++        return None;
++    }
++    let mut input = text.to_string();
++    input.push(' ');
++    let mut byte = 0;
++    let graphemes: Vec<_> = Graphemes::new(&input)
++        .map(|g| {
++            let start = byte;
++            byte += g.len();
++            (start, g)
++        })
++        .collect();
++    let mut chars = Vec::new();
++    let mut owners = Vec::new();
++    let mut rows = Vec::new();
++    let mut row_start = 0;
++    let mut used = 0;
++    for (g, (_, s)) in graphemes.iter().enumerate() {
++        let width = grapheme_column_width(s, None);
++        // Readline/libc and WezTerm disagree on some emoji/wide character widths.
++        // Fail closed rather than infer row boundaries from incompatible widths.
++        if width != 1 {
++            return None;
++        }
++        if used == cols {
++            rows.push(row_start..chars.len());
++            row_start = chars.len();
++            used = 0;
++        }
++        for c in s.chars() {
++            chars.push(c);
++            owners.push(g);
++        }
++        used += width;
++    }
++    rows.push(row_start..chars.len());
++    let mut bidi = BidiContext::new();
++    bidi.resolve_paragraph(&chars, ParagraphDirectionHint::AutoLeftToRight);
++    let mut stops = Vec::new();
++    let mut seen = vec![false; graphemes.len()];
++    for row in rows {
++        for i in bidi.reorder_line(row).1 {
++            let owner = owners[i];
++            if !seen[owner] {
++                seen[owner] = true;
++                stops.push(graphemes[owner].0);
++            }
++        }
++    }
++    if point > text.len() || !text.is_char_boundary(point) {
++        return None;
++    }
++    let containing = graphemes.iter().rev().find(|(b, _)| *b <= point)?.0;
++    let at = stops.iter().position(|&p| p == containing)?;
++    let next = if right {
++        (at + 1).min(stops.len() - 1)
++    } else {
++        at.saturating_sub(1)
++    };
++    Some(stops[next])
++}
++
++fn main() {
++    let args: Vec<_> = std::env::args().collect();
++    let parse = || -> Option<usize> {
++        if args.len() != 4 {
++            return None;
++        }
++        let point_chars: usize = args[1].parse().ok()?;
++        let right = match args[2].as_str() {
++            "left" => false,
++            "right" => true,
++            _ => return None,
++        };
++        let cols = args[3].parse().ok()?;
++        let mut text = String::new();
++        io::stdin().take(65537).read_to_string(&mut text).ok()?;
++        // Bash bind -x exposes character indices, not Readline's internal bytes.
++        let point = text
++            .char_indices()
++            .map(|(b, _)| b)
++            .chain(std::iter::once(text.len()))
++            .nth(point_chars)?;
++        let target = neighbor(&text, point, right, cols)?;
++        Some(text[..target].chars().count())
++    };
++    match parse() {
++        Some(point) => println!("{}", point),
++        None => std::process::exit(2),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn rtl_visual_left_changes_logical_point() {
++        assert_eq!(neighbor("سلام", 0, false, 40), Some(2));
++    }
++    #[test]
++    fn inside_combining_cluster_skips_the_whole_cluster() {
++        assert_eq!(neighbor("سَلام", 2, false, 40), Some(4));
++    }
++    #[test]
++    fn mixed_boundary_and_logical_end() {
++        assert_eq!(neighbor("ab اب cd", 3, true, 40), Some(7));
++        assert_eq!(neighbor("سلام", 8, true, 40), Some(6));
++        assert_eq!(neighbor("abc", 3, true, 40), Some(3));
++        assert_eq!(neighbor("", 0, false, 40), Some(0));
++    }
++    #[test]
++    fn unsupported_content_fails_closed() {
++        for text in [
++            "a\nb",
++            "a\tb",
++            "a\x1bb",
++            "界",
++            "🙂",
++            "\u{202e}ab",
++            "\u{2067}ab",
++        ] {
++            assert_eq!(neighbor(text, 0, true, 40), None, "{:?}", text);
++        }
++        assert_eq!(neighbor("ab", 8, true, 40), None);
++        assert_eq!(neighbor("اب", 1, true, 40), None);
++        assert_eq!(neighbor("ab", 0, true, 0), None);
++    }
++    #[test]
++    fn soft_wrap_uses_paragraph_global_indices() {
++        assert_eq!(neighbor("ابجدابجد", 8, false, 4), Some(10));
++        assert_eq!(neighbor("abcdefgh", 4, false, 4), Some(3));
++    }
++    #[test]
++    fn opposite_arrows_roundtrip_every_eligible_grapheme_stop() {
++        for text in ["abc", "سلام", "ab اب cd", "می‌خواهم ۱۲۳!", "سَلام لا", "اب 12!"]
++        {
++            for cols in [2, 5, 40] {
++                let mut byte = 0;
++                for g in Graphemes::new(&format!("{} ", text)) {
++                    for right in [false, true] {
++                        let target = neighbor(text, byte, right, cols).unwrap();
++                        if target != byte {
++                            assert_eq!(
++                                neighbor(text, target, !right, cols),
++                                Some(byte),
++                                "{:?}: {} -> {}",
++                                text,
++                                byte,
++                                target
++                            );
++                        }
++                    }
++                    byte += g.len();
++                }
++            }
++        }
++    }
++}

@@ -1,2 +1,5 @@
 wezterm-src/
 *.png
+.prowl/
+.prowl-setup.lock
+test-results/

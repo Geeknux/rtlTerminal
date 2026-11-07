@@ -2,7 +2,7 @@
 -- سپس: bash ~/Projects/rtlTerminal/tests/bidi-samples.sh
 local wezterm = require 'wezterm'
 
-return {
+local config = {
   bidi_enabled = true,
   -- LeftToRight | RightToLeft | AutoLeftToRight | AutoRightToLeft
   bidi_direction = 'AutoLeftToRight',
@@ -21,3 +21,9 @@ return {
   -- دیدید این را امتحان کنید:
   -- harfbuzz_features = { 'calt=0', 'liga=0' },
 }
+
+-- Explicit opt-in; normal shells and GUI key processing stay unchanged.
+if os.getenv('RTL_VISUAL_BASH') == '1' then
+  config.default_prog = { 'bash', wezterm.config_dir .. '/../scripts/visual-bash.sh' }
+end
+return config
