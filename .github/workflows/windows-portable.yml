@@ -1,0 +1,23 @@
+name: Windows portable test build
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-x64:
+    runs-on: windows-2025
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Build, test and package pinned upstream with RTL patches
+        shell: pwsh
+        run: ./scripts/build-windows.ps1
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtlTerminal-windows-x64
+          path: dist-windows/*.zip
+          if-no-files-found: error
+          retention-days: 14

@@ -3,3 +3,5 @@ wezterm-src/
 .prowl/
 .prowl-setup.lock
 test-results/
+wezterm-windows-src/
+dist-windows/
