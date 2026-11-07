@@ -1,3 +1,61 @@
+diff --git a/wezterm-font/src/shaper/harfbuzz.rs b/wezterm-font/src/shaper/harfbuzz.rs
+index e323e60..f1c0d50 100644
+--- a/wezterm-font/src/shaper/harfbuzz.rs
++++ b/wezterm-font/src/shaper/harfbuzz.rs
+@@ -44,14 +44,22 @@ fn get_only_char(s: &str) -> Option<char> {
+     }
+ }
+ 
++/// Hebrew, Arabic, Syriac, Thaana, NKo, Arabic Supplement/Extended and
++/// Arabic presentation forms.
++fn is_rtl_script_char(c: char) -> bool {
++    matches!(c as u32, 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF)
++}
++
+ fn make_glyphinfo(text: &str, num_cells: u8, font_idx: usize, info: &Info) -> GlyphInfo {
+     let is_space = text == " ";
++    let is_rtl_script = text.chars().any(is_rtl_script_char);
+     let only_char = get_only_char(text);
+     GlyphInfo {
+         #[cfg(any(debug_assertions, test))]
+         text: text.into(),
+         only_char,
+         is_space,
++        is_rtl_script,
+         num_cells,
+         font_idx,
+         glyph_pos: info.codepoint,
+diff --git a/wezterm-font/src/shaper/mod.rs b/wezterm-font/src/shaper/mod.rs
+index 3ca0feb..9b2f548 100644
+--- a/wezterm-font/src/shaper/mod.rs
++++ b/wezterm-font/src/shaper/mod.rs
+@@ -16,6 +16,9 @@ pub struct GlyphInfo {
+     /// If text is comprised of a single char, this is it
+     pub only_char: Option<char>,
+     pub is_space: bool,
++    /// True if the text of this glyph contains Arabic/Hebrew-script
++    /// characters; such glyphs must not be scaled down to fit a cell.
++    pub is_rtl_script: bool,
+     /// Number of cells occupied by this single glyph.
+     /// This accounts for eg: the shaper combining adjacent graphemes
+     /// into a single glyph, such as in `!=` and other ligatures.
+diff --git a/wezterm-gui/src/glyphcache.rs b/wezterm-gui/src/glyphcache.rs
+index f867494..73481c6 100644
+--- a/wezterm-gui/src/glyphcache.rs
++++ b/wezterm-gui/src/glyphcache.rs
+@@ -726,7 +726,11 @@ impl GlyphCache {
+         // overflow.  0.5 is the typical monospace font aspect ratio.
+         let is_square_or_wide = aspect >= 0.7;
+ 
+-        let allow_width_overflow = if is_square_or_wide {
++        // Arabic-script glyphs are shaped with real (proportional) advances
++        // and may legitimately be wider than a cell; scaling them down
++        // makes some words look smaller than their neighbours.
++        let allow_width_overflow = info.is_rtl_script;
++        let allow_width_overflow = allow_width_overflow || if is_square_or_wide {
+             match self.fonts.config().allow_square_glyphs_to_overflow_width {
+                 AllowSquareGlyphOverflow::Never => false,
+                 AllowSquareGlyphOverflow::Always => true,
 diff --git a/wezterm-gui/src/shapecache.rs b/wezterm-gui/src/shapecache.rs
 index e01ea4d..ff83fa1 100644
 --- a/wezterm-gui/src/shapecache.rs

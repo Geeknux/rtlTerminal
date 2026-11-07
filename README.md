@@ -29,7 +29,9 @@ bash tests/bidi-samples.sh
 
 ## Status
 
-Early. Done: joined shaping for RTL runs. Open: word spacing/font choice, cursor placement while editing a line, wrapped RTL lines.
+Early. Done: joined shaping for RTL runs, no down-scaling of Arabic-script glyphs, Vazirmatn at scale 1.2 as the recommended Persian fallback font (see `tests/wezterm-test.lua`). Open: cursor placement while editing a line, wrapped RTL lines.
+
+Known: the upstream unit tests (`shapecache.rs`, k9 snapshots in `harfbuzz.rs`) need updating for the new `is_space` / `is_rtl_script` fields before `cargo test` passes.
 
 ## License
 

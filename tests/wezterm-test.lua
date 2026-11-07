@@ -9,7 +9,8 @@ return {
 
   font = wezterm.font_with_fallback {
     'JetBrains Mono',
-    'Noto Naskh Arabic',
+    { family = os.getenv('RTL_ARABIC_FONT') or 'Vazirmatn',
+      scale = tonumber(os.getenv('RTL_ARABIC_SCALE') or '1.2') },
   },
   font_size = 13,
 
