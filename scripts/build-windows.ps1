@@ -36,7 +36,8 @@ $env:CARGO_INCREMENTAL = '0'
 Push-Location $SourceDir
 try {
     cargo build --locked --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
-    cargo test --locked --release -p wezterm-bidi -p wezterm-surface --lib
+    # Surface's upstream image tests are not gated when its default features are empty.
+    cargo test --locked --release -p wezterm-bidi -p wezterm-surface --features wezterm-surface/use_image --lib
 } finally { Pop-Location }
 $Name = 'rtlTerminal-windows-x64-' + $Revision.Substring(0, 12)
 $Package = Join-Path $OutputDir $Name
