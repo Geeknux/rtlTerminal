@@ -1,0 +1,668 @@
+diff --git a/term/src/screen.rs b/term/src/screen.rs
+index 4c52d37..b6e453b 100644
+--- a/term/src/screen.rs
++++ b/term/src/screen.rs
+@@ -191,6 +191,18 @@ impl Screen {
+     }
+ 
+     /// Resize the physical, viewable portion of the screen
++    /// Create a blank line to pad the screen out during a resize.
++    /// It inherits the bidi settings of the existing lines so that
++    /// rows added by resizing behave like any other row.
++    fn new_padding_line(&self, seqno: SequenceNo) -> Line {
++        let mut line = Line::new(seqno);
++        if let Some(existing) = self.lines.back().or_else(|| self.lines.front()) {
++            let (enabled, hint) = existing.bidi_info();
++            line.set_bidi_info(enabled, hint, seqno);
++        }
++        line
++    }
++
+     pub fn resize(
+         &mut self,
+         size: TerminalSize,
+@@ -259,8 +271,8 @@ impl Screen {
+         // lines than the viewport size, or we resized taller,
+         // pad us back out to the viewport size
+         while self.lines.len() < physical_rows {
+-            // FIXME: borrow bidi mode from line
+-            self.lines.push_back(Line::new(seqno));
++            let line = self.new_padding_line(seqno);
++            self.lines.push_back(line);
+         }
+ 
+         let new_cursor_y;
+@@ -303,8 +315,8 @@ impl Screen {
+                 physical_rows.saturating_sub(new_cursor_y as usize);
+             let actual_num_rows_after_cursor = self.lines.len().saturating_sub(cursor_y);
+             for _ in actual_num_rows_after_cursor..required_num_rows_after_cursor {
+-                // FIXME: borrow bidi mode from line
+-                self.lines.push_back(Line::new(seqno));
++                let line = self.new_padding_line(seqno);
++                self.lines.push_back(line);
+             }
+         } else {
+             // Compute the new cursor location; this is logically the inverse
+diff --git a/wezterm-font/src/shaper/harfbuzz.rs b/wezterm-font/src/shaper/harfbuzz.rs
+index e323e60..10a298a 100644
+--- a/wezterm-font/src/shaper/harfbuzz.rs
++++ b/wezterm-font/src/shaper/harfbuzz.rs
+@@ -44,14 +44,22 @@ fn get_only_char(s: &str) -> Option<char> {
+     }
+ }
+ 
++/// Hebrew, Arabic, Syriac, Thaana, NKo, Arabic Supplement/Extended and
++/// Arabic presentation forms.
++fn is_rtl_script_char(c: char) -> bool {
++    matches!(c as u32, 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF)
++}
++
+ fn make_glyphinfo(text: &str, num_cells: u8, font_idx: usize, info: &Info) -> GlyphInfo {
+     let is_space = text == " ";
++    let is_rtl_script = text.chars().any(is_rtl_script_char);
+     let only_char = get_only_char(text);
+     GlyphInfo {
+         #[cfg(any(debug_assertions, test))]
+         text: text.into(),
+         only_char,
+         is_space,
++        is_rtl_script,
+         num_cells,
+         font_idx,
+         glyph_pos: info.codepoint,
+@@ -896,6 +904,7 @@ mod test {
+             'a',
+         ),
+         is_space: false,
++        is_rtl_script: false,
+         num_cells: 1,
+         cluster: 0,
+         font_idx: 0,
+@@ -911,6 +920,7 @@ mod test {
+             'b',
+         ),
+         is_space: false,
++        is_rtl_script: false,
+         num_cells: 1,
+         cluster: 1,
+         font_idx: 0,
+@@ -926,6 +936,7 @@ mod test {
+             'c',
+         ),
+         is_space: false,
++        is_rtl_script: false,
+         num_cells: 1,
+         cluster: 2,
+         font_idx: 0,
+@@ -964,6 +975,7 @@ mod test {
+             '<',
+         ),
+         is_space: false,
++        is_rtl_script: false,
+         num_cells: 1,
+         cluster: 0,
+         font_idx: 0,
+@@ -1004,6 +1016,7 @@ mod test {
+             '<',
+         ),
+         is_space: false,
++        is_rtl_script: false,
+         num_cells: 1,
+         cluster: 0,
+         font_idx: 0,
+@@ -1019,6 +1032,7 @@ mod test {
+             '-',
+         ),
+         is_space: false,
++        is_rtl_script: false,
+         num_cells: 1,
+         cluster: 1,
+         font_idx: 0,
+@@ -1057,6 +1071,7 @@ mod test {
+             '<',
+         ),
+         is_space: false,
++        is_rtl_script: false,
+         num_cells: 1,
+         cluster: 0,
+         font_idx: 0,
+@@ -1072,6 +1087,7 @@ mod test {
+             '-',
+         ),
+         is_space: false,
++        is_rtl_script: false,
+         num_cells: 1,
+         cluster: 1,
+         font_idx: 0,
+@@ -1087,6 +1103,7 @@ mod test {
+             '-',
+         ),
+         is_space: false,
++        is_rtl_script: false,
+         num_cells: 1,
+         cluster: 2,
+         font_idx: 0,
+@@ -1126,6 +1143,7 @@ mod test {
+             'x',
+         ),
+         is_space: false,
++        is_rtl_script: false,
+         num_cells: 1,
+         cluster: 0,
+         font_idx: 0,
+@@ -1141,6 +1159,7 @@ mod test {
+             ' ',
+         ),
+         is_space: true,
++        is_rtl_script: false,
+         num_cells: 1,
+         cluster: 1,
+         font_idx: 0,
+@@ -1156,6 +1175,7 @@ mod test {
+             'x',
+         ),
+         is_space: false,
++        is_rtl_script: false,
+         num_cells: 1,
+         cluster: 2,
+         font_idx: 0,
+@@ -1195,6 +1215,7 @@ mod test {
+             'x',
+         ),
+         is_space: false,
++        is_rtl_script: false,
+         num_cells: 1,
+         cluster: 0,
+         font_idx: 0,
+@@ -1210,6 +1231,7 @@ mod test {
+             '\u{3000}',
+         ),
+         is_space: false,
++        is_rtl_script: false,
+         num_cells: 2,
+         cluster: 1,
+         font_idx: 0,
+@@ -1225,6 +1247,7 @@ mod test {
+             'x',
+         ),
+         is_space: false,
++        is_rtl_script: false,
+         num_cells: 1,
+         cluster: 4,
+         font_idx: 0,
+diff --git a/wezterm-font/src/shaper/mod.rs b/wezterm-font/src/shaper/mod.rs
+index 3ca0feb..9b2f548 100644
+--- a/wezterm-font/src/shaper/mod.rs
++++ b/wezterm-font/src/shaper/mod.rs
+@@ -16,6 +16,9 @@ pub struct GlyphInfo {
+     /// If text is comprised of a single char, this is it
+     pub only_char: Option<char>,
+     pub is_space: bool,
++    /// True if the text of this glyph contains Arabic/Hebrew-script
++    /// characters; such glyphs must not be scaled down to fit a cell.
++    pub is_rtl_script: bool,
+     /// Number of cells occupied by this single glyph.
+     /// This accounts for eg: the shaper combining adjacent graphemes
+     /// into a single glyph, such as in `!=` and other ligatures.
+diff --git a/wezterm-gui/src/glyphcache.rs b/wezterm-gui/src/glyphcache.rs
+index f867494..73481c6 100644
+--- a/wezterm-gui/src/glyphcache.rs
++++ b/wezterm-gui/src/glyphcache.rs
+@@ -726,7 +726,11 @@ impl GlyphCache {
+         // overflow.  0.5 is the typical monospace font aspect ratio.
+         let is_square_or_wide = aspect >= 0.7;
+ 
+-        let allow_width_overflow = if is_square_or_wide {
++        // Arabic-script glyphs are shaped with real (proportional) advances
++        // and may legitimately be wider than a cell; scaling them down
++        // makes some words look smaller than their neighbours.
++        let allow_width_overflow = info.is_rtl_script;
++        let allow_width_overflow = allow_width_overflow || if is_square_or_wide {
+             match self.fonts.config().allow_square_glyphs_to_overflow_width {
+                 AllowSquareGlyphOverflow::Never => false,
+                 AllowSquareGlyphOverflow::Always => true,
+diff --git a/wezterm-gui/src/shapecache.rs b/wezterm-gui/src/shapecache.rs
+index e01ea4d..c30d4bf 100644
+--- a/wezterm-gui/src/shapecache.rs
++++ b/wezterm-gui/src/shapecache.rs
+@@ -18,6 +18,7 @@ pub struct GlyphPosition {
+     pub x_offset: PixelLength,
+     pub bearing_x: f32,
+     pub bitmap_pixel_width: u32,
++    pub is_space: bool,
+ }
+ 
+ #[derive(Debug)]
+@@ -42,6 +43,7 @@ impl ShapedInfo {
+                         .as_ref()
+                         .map_or(0, |t| t.coords.width() as u32),
+                     num_cells: info.num_cells,
++                    is_space: info.is_space,
+                     x_offset: info.x_offset,
+                     bearing_x: glyph.bearing_x.get() as f32,
+                 },
+@@ -228,6 +230,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 1.0,
+         bitmap_pixel_width: 8,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 1742,
+@@ -235,6 +238,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 0,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 1742,
+@@ -242,6 +246,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 0,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 896,
+@@ -249,6 +254,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: -15.0,
+         bitmap_pixel_width: 20,
++        is_space: false,
+     },
+ ]
+ "
+@@ -337,6 +343,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 1.0,
+         bitmap_pixel_width: 8,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 214,
+@@ -344,6 +351,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 1.0,
+         bitmap_pixel_width: 8,
++        is_space: false,
+     },
+ ]
+ "
+@@ -359,6 +367,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 1.0,
+         bitmap_pixel_width: 8,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 958,
+@@ -366,6 +375,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 0,
++        is_space: true,
+     },
+     GlyphPosition {
+         glyph_idx: 214,
+@@ -373,6 +383,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 1.0,
+         bitmap_pixel_width: 8,
++        is_space: false,
+     },
+ ]
+ "
+@@ -388,6 +399,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 1.0,
+         bitmap_pixel_width: 8,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 1742,
+@@ -395,6 +407,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 0,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 1742,
+@@ -402,6 +415,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 0,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 896,
+@@ -409,6 +423,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: -15.0,
+         bitmap_pixel_width: 20,
++        is_space: false,
+     },
+ ]
+ "
+@@ -424,6 +439,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 1.0,
+         bitmap_pixel_width: 8,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 860,
+@@ -431,6 +447,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 9,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 290,
+@@ -438,6 +455,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 1.0,
+         bitmap_pixel_width: 8,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 320,
+@@ -445,6 +463,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 1.0,
+         bitmap_pixel_width: 8,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 860,
+@@ -452,6 +471,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 9,
++        is_space: false,
+     },
+ ]
+ "
+@@ -467,6 +487,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 1.0,
+         bitmap_pixel_width: 8,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 958,
+@@ -474,6 +495,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 0,
++        is_space: true,
+     },
+     GlyphPosition {
+         glyph_idx: 958,
+@@ -481,6 +503,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 0,
++        is_space: true,
+     },
+     GlyphPosition {
+         glyph_idx: 214,
+@@ -488,6 +511,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 1.0,
+         bitmap_pixel_width: 8,
++        is_space: false,
+     },
+ ]
+ "
+@@ -503,6 +527,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 0,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 1588,
+@@ -510,6 +535,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: -9.0,
+         bitmap_pixel_width: 17,
++        is_space: false,
+     },
+ ]
+ "
+@@ -525,6 +551,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 0,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 1613,
+@@ -532,6 +559,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: -8.0,
+         bitmap_pixel_width: 16,
++        is_space: false,
+     },
+ ]
+ "
+@@ -547,6 +575,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 0,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 1742,
+@@ -554,6 +583,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 0,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 1562,
+@@ -561,6 +591,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: -18.0,
+         bitmap_pixel_width: 27,
++        is_space: false,
+     },
+ ]
+ "
+@@ -583,6 +614,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 10,
++        is_space: false,
+     },
+ ]
+ "
+@@ -605,6 +637,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: -0.8333333,
+         bitmap_pixel_width: 12,
++        is_space: false,
+     },
+ ]
+ "
+@@ -620,6 +653,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 0,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 1742,
+@@ -627,6 +661,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 0,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 1742,
+@@ -634,6 +669,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 0,
++        is_space: false,
+     },
+     GlyphPosition {
+         glyph_idx: 1595,
+@@ -641,6 +677,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: -28.0,
+         bitmap_pixel_width: 37,
++        is_space: false,
+     },
+ ]
+ "
+@@ -667,6 +704,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 16,
++        is_space: false,
+     },
+ ]
+ "
+@@ -690,6 +728,7 @@ mod test {
+         x_offset: 0.0,
+         bearing_x: 0.0,
+         bitmap_pixel_width: 20,
++        is_space: false,
+     },
+ ]
+ "
+diff --git a/wezterm-gui/src/termwindow/render/screen_line.rs b/wezterm-gui/src/termwindow/render/screen_line.rs
+index c930e47..3ccfdfa 100644
+--- a/wezterm-gui/src/termwindow/render/screen_line.rs
++++ b/wezterm-gui/src/termwindow/render/screen_line.rs
+@@ -88,7 +88,7 @@ impl crate::TermWindow {
+ 
+         let mut composition_width = 0;
+ 
+-        let (_bidi_enabled, bidi_direction) = params.line.bidi_info();
++        let (bidi_enabled, bidi_direction) = params.line.bidi_info();
+         let direction = bidi_direction.direction();
+ 
+         // Do we need to shape immediately, or can we use the pre-shaped data?
+@@ -475,6 +475,46 @@ impl crate::TermWindow {
+                 };
+             }
+ 
++            // RTL runs (Arabic, Persian, Hebrew...) are shaped into glyphs
++            // whose advances don't match the fixed cell width. Forcing each
++            // glyph into a cell slot breaks cursive joining. For such runs
++            // we place glyphs using their real advances, right-justified
++            // within the run's cell span. The run still occupies exactly
++            // `cluster.width` cells, so cursor, selection and column
++            // alignment are unaffected.
++            let rtl_proportional = bidi_enabled
++                && !params.use_pixel_positioning
++                && cluster.direction == Direction::RightToLeft;
++            let cluster_start_x = cluster_x_pos;
++            let mut cluster_span = cluster.width as f32 * cell_width;
++            if rtl_proportional && direction == Direction::LeftToRight {
++                // Never extend past the right edge of the line, even if the
++                // cluster is counted as wider than the remaining cells.
++                cluster_span = cluster_span.min((params.pixel_width - cluster_start_x).max(0.));
++            }
++            // Spare room (cell span minus real glyph widths) is spread over
++            // the spaces between words so letters keep touching each other.
++            // A run without spaces is simply right-justified in its span.
++            let mut space_extra = 0.;
++            // When the shaped run is wider than its cell span, compress the
++            // advances so that the run fits instead of spilling over (and
++            // being clipped at) the edge.
++            let mut advance_scale = 1.;
++            if rtl_proportional {
++                let natural_width = item.pixel_width * width_scale;
++                if natural_width > cluster_span && natural_width > 0. {
++                    advance_scale = cluster_span / natural_width;
++                }
++                let slack = (cluster_span - natural_width).max(0.);
++                let spaces = glyph_info.iter().filter(|i| i.pos.is_space).count();
++                if spaces > 0 {
++                    space_extra = slack / spaces as f32;
++                } else {
++                    cluster_x_pos += slack;
++                }
++            }
++            let pixel_glyphs = params.use_pixel_positioning || rtl_proportional;
++
+             for info in glyph_info.iter() {
+                 let glyph = &info.glyph;
+ 
+@@ -531,13 +571,15 @@ impl crate::TermWindow {
+                         // TODO: clipping, but we can do that based on pixels
+ 
+                         let pos_x = cluster_x_pos
+-                            + if params.use_pixel_positioning {
++                            + if pixel_glyphs {
+                                 (glyph.x_offset + glyph.bearing_x).get() as f32
+                             } else {
+                                 0.
+                             };
+ 
+-                        if pos_x > params.pixel_width {
++                        // RTL runs put the first logical glyphs at the right end,
++                        // so we must not drop the tail of the glyph list here.
++                        if pos_x > params.pixel_width && !rtl_proportional {
+                             log::trace!("breaking on overflow {} > {}", pos_x, params.pixel_width);
+                             break;
+                         }
+@@ -696,13 +738,23 @@ impl crate::TermWindow {
+                     phys_cell_idx += info.pos.num_cells as usize;
+                 }
+                 visual_cell_idx += info.pos.num_cells as usize;
+-                cluster_x_pos += if params.use_pixel_positioning {
+-                    glyph.x_advance.get() as f32 * width_scale
++                cluster_x_pos += if pixel_glyphs {
++                    glyph.x_advance.get() as f32 * width_scale * advance_scale
++                        + if rtl_proportional && info.pos.is_space {
++                            space_extra
++                        } else {
++                            0.
++                        }
+                 } else {
+                     info.pos.num_cells as f32 * cell_width
+                 };
+             }
+ 
++            if rtl_proportional {
++                // Snap back to the cell grid for whatever follows
++                cluster_x_pos = cluster_start_x + cluster_span;
++            }
++
+             match direction {
+                 Direction::RightToLeft => {
+                     // And decrement it again
+diff --git a/wezterm-surface/src/line/line.rs b/wezterm-surface/src/line/line.rs
+index 7c7bb32..98e9a17 100644
+--- a/wezterm-surface/src/line/line.rs
++++ b/wezterm-surface/src/line/line.rs
+@@ -212,6 +212,9 @@ impl Line {
+     /// Wrap the line so that it fits within the provided width.
+     /// Returns the list of resultant line(s)
+     pub fn wrap(self, width: usize, seqno: SequenceNo) -> Vec<Self> {
++        // The rows produced by wrapping must keep the bidi settings of the
++        // logical line, otherwise they lose bidi after a resize/rewrap.
++        let (bidi_enabled, bidi_hint) = self.bidi_info();
+         let mut cells: Vec<CellRef> = self.visible_cells().collect();
+         if let Some(end_idx) = cells.iter().rposition(|c| c.str() != " ") {
+             cells.truncate(end_idx + 1);
+@@ -227,7 +230,9 @@ impl Line {
+                     lines
+                         .last_mut()
+                         .map(|line| line.set_last_cell_was_wrapped(true, seqno));
+-                    lines.push(Line::new(seqno));
++                    let mut new_line = Line::new(seqno);
++                    new_line.set_bidi_info(bidi_enabled, bidi_hint, seqno);
++                    lines.push(new_line);
+                     delta = cell.cell_index();
+                 }
+                 let line = lines.last_mut().unwrap();

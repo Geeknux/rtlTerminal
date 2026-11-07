@@ -27,11 +27,17 @@ bash tests/bidi-samples.sh
 
 `bidi_enabled = true` must be set in the config (it is off by default in WezTerm).
 
+## What the patch changes
+
+- **Glyph placement** (`screen_line.rs`): RTL runs use real glyph advances, right-justified in their cell span; spare room goes to the spaces, overflow is compressed so nothing is clipped.
+- **No down-scaling** of Arabic-script glyphs (`glyphcache.rs`, `is_rtl_script` flag from the shaper).
+- **Resize/rewrap lost bidi** (`term/src/screen.rs`, `wezterm-surface/src/line/line.rs`): rows added or re-wrapped when the window is resized did not inherit the bidi settings, so they were rendered as plain LTR text with each word separate. They now inherit them (upstream `FIXME: borrow bidi mode from line`).
+
 ## Status
 
-Early. Done: joined shaping for RTL runs, no down-scaling of Arabic-script glyphs, Vazirmatn at scale 1.2 as the recommended Persian fallback font (see `tests/wezterm-test.lua`). Open: cursor placement while editing a line, wrapped RTL lines.
+Working: joined shaping, correct word order (also on wrapped rows), ZWNJ and diacritics, mixed LTR/RTL, numbers, cursor navigation. Unit tests of the touched crates pass.
 
-Known: the upstream unit tests (`shapecache.rs`, k9 snapshots in `harfbuzz.rs`) need updating for the new `is_space` / `is_rtl_script` fields before `cargo test` passes.
+Open: word-spacing could be tighter (a font with Arabic glyphs closer to the cell width would help), RTL runs and wrapped paragraphs are still reordered row by row (implicit mode), and `Left`/`Right` follow logical order as in any terminal.
 
 ## License
 

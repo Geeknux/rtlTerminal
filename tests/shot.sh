@@ -15,8 +15,8 @@ for c in json.load(sys.stdin):
 kill_test || true
 sleep 1
 (setsid "$P/wezterm-src/target/release/wezterm-gui" --config-file "$P/tests/wezterm-test.lua" \
-  start --class rtltest -- bash -c "bash $SCRIPT <<< 'سلام'; sleep 60" >/tmp/rtltest.log 2>&1 &)
-sleep 6
+  start --class rtltest -- bash -c "sleep 3; bash $SCRIPT <<< 'سلام'; sleep 60" >/tmp/rtltest.log 2>&1 &)
+sleep 9
 G=$(hyprctl clients -j | python3 -c "
 import json,sys
 for c in json.load(sys.stdin):
