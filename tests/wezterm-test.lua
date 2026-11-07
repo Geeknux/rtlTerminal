@@ -12,7 +12,7 @@ return {
     { family = os.getenv('RTL_ARABIC_FONT') or 'Vazirmatn',
       scale = tonumber(os.getenv('RTL_ARABIC_SCALE') or '1.2') },
   },
-  font_size = 13,
+  font_size = tonumber(os.getenv('RTL_FONT_SIZE') or '13'),
 
   -- آزمایش ۱: با true هم امتحان کنید و تفاوت را گزارش دهید
   experimental_pixel_positioning = false,
